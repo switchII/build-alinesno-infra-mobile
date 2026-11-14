@@ -26,7 +26,8 @@ name: Android Build & Publish
 #   ANDROID_KEYSTORE_PASSWORD       密钥库密码（可选）
 #   ANDROID_KEY_ALIAS               密钥别名（可选）
 #   ANDROID_KEY_PASSWORD            密钥密码（可选，留空则与密钥库密码相同）
-#   Variables: API_BASE_URL         注入 --dart-define=API_BASE_URL（非密钥，放 Variables）
+#   Variables: 无。服务地址不靠构建期注入：它来自二维码载荷的 base 或手动输入的配对码，
+#              见 lib/core/config/app_config.dart，所以这里不传 --dart-define=API_BASE_URL。
 
 on:
   workflow_dispatch:
@@ -296,26 +297,20 @@ jobs:
       - name: 构建 APK（按 ABI 分包）
         if: ${{ inputs.build_target != 'aab' }}
         working-directory: ${{ env.SOURCE_DIR }}
-        env:
-          API_BASE_URL: ${{ vars.API_BASE_URL }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086
           flutter build apk --release ${FLAVOR_ARG} --split-per-abi \
-            --build-name="${VERSION}" --build-number="${BUILD_NUMBER}" \
-            --dart-define=API_BASE_URL="${API_BASE_URL:-}"
+            --build-name="${VERSION}" --build-number="${BUILD_NUMBER}"
 
       - name: 构建 AAB
         if: ${{ inputs.build_target != 'apk' }}
         working-directory: ${{ env.SOURCE_DIR }}
-        env:
-          API_BASE_URL: ${{ vars.API_BASE_URL }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086
           flutter build appbundle --release ${FLAVOR_ARG} \
-            --build-name="${VERSION}" --build-number="${BUILD_NUMBER}" \
-            --dart-define=API_BASE_URL="${API_BASE_URL:-}"
+            --build-name="${VERSION}" --build-number="${BUILD_NUMBER}"
 
       - name: 归集产物并统一命名
         working-directory: ${{ env.SOURCE_DIR }}
