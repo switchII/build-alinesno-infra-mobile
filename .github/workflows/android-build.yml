@@ -8,9 +8,9 @@ name: Android Build & Publish
 #
 # 流程
 #   1) 手动触发并填写 tag（留空取源码仓库最新 tag）→ 检出该 tag（克隆后校验 tag 是否存在）；
-#   2) 门禁：flutter analyze + flutter test（格式检查只提示，不阻塞）；
-#   3) 构建 APK（按 ABI 分包）/ AAB，版本号取自 tag（--build-name/--build-number）；
-#   4) 产物上传七牛（qshell，做法与 alinesno-infra-cowork-desk 的 build-windows-cli-sign.yml 一致），
+#   2) 门禁：flutter analyze（格式检查与单元测试不跑，测试只在本地/后续流水线跑）；
+#   3) 构建 APK（只出 APK；主流机型覆盖 arm64-v8a + armeabi-v7a，两者合包），版本号取自 tag；
+#   4) 产物 + latest.json 上传七牛（qshell，做法与 alinesno-infra-cowork-desk 的 build-windows-cli-sign.yml 一致），
 #      同时归档到 Actions Artifacts；
 #   5) 有 tag 时在构建仓库创建 draft Release。
 #
@@ -42,11 +42,6 @@ on:
         type: choice
         default: test
         options: [dev, test, prod]
-      build_target:
-        description: "产物类型"
-        type: choice
-        default: both
-        options: [apk, aab, both]
   repository_dispatch:
     types: [trigger-build-mobile]
   workflow_call:
@@ -60,11 +55,6 @@ on:
         description: "构建 flavor"
         required: false
         default: "test"
-        type: string
-      build_target:
-        description: "apk / aab / both"
-        required: false
-        default: "both"
         type: string
 
 # Release 需要写权限；七牛凭据走 Secrets，不依赖仓库权限
@@ -256,19 +246,6 @@ jobs:
             echo "格式检查通过"
           fi
 
-      - name: 单元测试与 Widget 测试
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: flutter test --coverage
-
-      - name: 上传覆盖率
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-run-${{ github.run_number }}
-          path: ${{ env.SOURCE_DIR }}/coverage/lcov.info
-          retention-days: 7
-          if-no-files-found: ignore
-
       - name: 解析构建参数
         id: args
         shell: bash
@@ -313,22 +290,15 @@ jobs:
         if: env.KEYSTORE_READY != 'true'
         run: echo "::warning::未配置签名 Secrets，本次产物使用 debug 签名，不能作为对外发布包"
 
-      - name: 构建 APK（按 ABI 分包）
-        if: ${{ inputs.build_target != 'aab' }}
+      - name: 构建 APK（arm64-v8a + armeabi-v7a 合包）
         working-directory: ${{ env.SOURCE_DIR }}
         run: |
           set -euo pipefail
+          # 只出 APK：主流机型就是 arm64-v8a，armeabi-v7a 兜住老机器；
+          # x86_64 只用于模拟器，不进发布包，避免无谓增大体积。
           # shellcheck disable=SC2086
-          flutter build apk --release ${FLAVOR_ARG} --split-per-abi \
-            --build-name="${VERSION}" --build-number="${BUILD_NUMBER}"
-
-      - name: 构建 AAB
-        if: ${{ inputs.build_target != 'apk' }}
-        working-directory: ${{ env.SOURCE_DIR }}
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC2086
-          flutter build appbundle --release ${FLAVOR_ARG} \
+          flutter build apk --release ${FLAVOR_ARG} \
+            --target-platform android-arm64,android-arm \
             --build-name="${VERSION}" --build-number="${BUILD_NUMBER}"
 
       - name: 归集产物并统一命名
@@ -338,21 +308,13 @@ jobs:
           dest="${{ github.workspace }}/dist/android/${FLAVOR}"
           mkdir -p "$dest"
           shopt -s nullglob
-          # APK：app-<abi>-release.apk → AIP-Copilot-<version>-<abi>.apk
-          for f in build/app/outputs/flutter-apk/*.apk; do
-            base="$(basename "$f")"
-            if [[ "$base" =~ ^app-(.+)-release\.apk$ ]]; then
-              abi="${BASH_REMATCH[1]}"
-            else
-              abi="universal"
-            fi
-            cp -f "$f" "$dest/${APP_NAME}-${VERSION}-${abi}.apk"
-          done
-          # AAB：app-release.aab / app-<flavor>-release.aab → AIP-Copilot-<version>.aab
-          for f in build/app/outputs/bundle/*/*.aab; do
-            cp -f "$f" "$dest/${APP_NAME}-${VERSION}.aab"
-            break
-          done
+          # app-release.apk / app-<flavor>-release.apk → AIP-Copilot-<version>.apk
+          apks=(build/app/outputs/flutter-apk/*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::未找到 APK 产物"
+            exit 1
+          fi
+          cp -f "${apks[0]}" "$dest/${APP_NAME}-${VERSION}.apk"
           echo "---- 产物清单 ----"
           ls -lh "$dest"
 
@@ -408,6 +370,56 @@ jobs:
             qshell rput --overwrite "$QINIU_BUCKET" "$key" "$f"
             echo "✅ 上传成功：https://${QINIU_DOMAIN}/${key}"
           done
+
+      - name: 生成并上传 latest.json
+        if: env.QINIU_READY == 'true'
+        shell: bash
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          qshell account "$QINIU_ACCESS_KEY" "$QINIU_SECRET_KEY" "github-action"
+
+          domain="https://${QINIU_DOMAIN}"
+          apk="$(ls "${{ github.workspace }}"/dist/android/"${FLAVOR}"/*.apk | head -1)"
+          name="$(basename "$apk")"
+          url="${domain}/${QINIU_DIR}/${name}"
+          size="$(stat -c%s "$apk")"
+          sha256="$(sha256sum "$apk" | cut -d' ' -f1)"
+
+          # 与 cowork-desk 的 latest.json 同构：version / notes / pub_date + platforms.<平台>。
+          # 先读回旧文件再合并，避免把以后新增的平台（如 ios）条目盖掉。
+          if curl -sf -o existing_latest.json "${domain}/${QINIU_DIR}/latest.json" \
+             && jq empty existing_latest.json 2>/dev/null; then
+            base="$(cat existing_latest.json)"
+          else
+            base='{}'
+          fi
+
+          echo "$base" | jq \
+            --arg v "${VERSION}" \
+            --arg notes "${APP_NAME} ${VERSION}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg url "$url" \
+            --argjson size "$size" \
+            --arg sha "$sha256" \
+            '.version = $v | .notes = $notes | .pub_date = $pub_date
+             | (.platforms // {}) as $p
+             | .platforms = ($p + {
+                 android: {
+                   url: $url,
+                   size: $size,
+                   sha256: $sha,
+                   abis: ["arm64-v8a", "armeabi-v7a"]
+                 }
+               })' > latest.json
+
+          echo "📄 latest.json:"
+          cat latest.json
+          qshell rput --overwrite "$QINIU_BUCKET" "${QINIU_DIR}/latest.json" "$(pwd)/latest.json"
+          echo "✅ https://${QINIU_DOMAIN}/${QINIU_DIR}/latest.json"
+
       # ======================================================================================
 
       - name: 构建结果摘要
@@ -425,6 +437,7 @@ jobs:
             echo "| Flavor | \`${FLAVOR:-test}\` |"
             echo "| 发布签名 | $([ -f "${SOURCE_DIR}/android/keystores/release.jks" ] && echo '已注入' || echo '未配置，debug 签名') |"
             echo "| 七牛上传 | $([ "${QINIU_READY:-false}" = "true" ] && echo "已开启（\`${QINIU_DIR}/\`）" || echo '未配置 Secrets，已跳过') |"
+            echo "| 版本清单 | $([ "${QINIU_READY:-false}" = "true" ] && echo "https://${QINIU_DOMAIN}/${QINIU_DIR}/latest.json" || echo '未上传') |"
             echo "| 触发 | \`${GITHUB_EVENT_NAME}\` / Run #${{ github.run_number }} |"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -d "${{ github.workspace }}/dist" ]; then
@@ -444,6 +457,5 @@ jobs:
           draft: true
           files: |
             dist/android/${{ env.FLAVOR }}/*.apk
-            dist/android/${{ env.FLAVOR }}/*.aab
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
