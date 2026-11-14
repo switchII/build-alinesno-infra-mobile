@@ -348,7 +348,7 @@ jobs:
         if: env.QINIU_READY != 'true'
         run: echo "::warning::未配置 QINIU_ACCESS_KEY / QINIU_SECRET_KEY / QINIU_BUCKET，跳过七牛上传，产物仅归档在 Actions Artifacts"
 
-      - name: 上传产物到七牛
+      - name: 上传产物到七牛并更新 latest.json
         if: env.QINIU_READY == 'true'
         shell: bash
         env:
@@ -356,11 +356,16 @@ jobs:
           QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
         run: |
           set -euo pipefail
+          # qshell account 每个 runner 只能执行一次（第二次会报
+          # "Account Name: github-action already exist in local db"），
+          # 所以账号初始化与 APK / latest.json 上传都放在同一步里。
           qshell account "$QINIU_ACCESS_KEY" "$QINIU_SECRET_KEY" "github-action"
 
+          dist="${{ github.workspace }}/dist/android/${FLAVOR}"
           shopt -s nullglob
-          files=("${{ github.workspace }}"/dist/android/"${FLAVOR}"/*)
-          if [ "${#files[@]}" -eq 0 ]; then
+          files=("$dist"/*)
+          apks=("$dist"/*.apk)
+          if [ "${#files[@]}" -eq 0 ] || [ "${#apks[@]}" -eq 0 ]; then
             echo "::error::没有可上传的产物"
             exit 1
           fi
@@ -371,26 +376,16 @@ jobs:
             echo "✅ 上传成功：https://${QINIU_DOMAIN}/${key}"
           done
 
-      - name: 生成并上传 latest.json
-        if: env.QINIU_READY == 'true'
-        shell: bash
-        env:
-          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
-          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
-        run: |
-          set -euo pipefail
-          qshell account "$QINIU_ACCESS_KEY" "$QINIU_SECRET_KEY" "github-action"
-
-          domain="https://${QINIU_DOMAIN}"
-          apk="$(ls "${{ github.workspace }}"/dist/android/"${FLAVOR}"/*.apk | head -1)"
+          # ---- latest.json：最新版本信息，供分发页 / 检查更新读取 ----
+          apk="${apks[0]}"
           name="$(basename "$apk")"
-          url="${domain}/${QINIU_DIR}/${name}"
+          url="https://${QINIU_DOMAIN}/${QINIU_DIR}/${name}"
           size="$(stat -c%s "$apk")"
           sha256="$(sha256sum "$apk" | cut -d' ' -f1)"
 
           # 与 cowork-desk 的 latest.json 同构：version / notes / pub_date + platforms.<平台>。
           # 先读回旧文件再合并，避免把以后新增的平台（如 ios）条目盖掉。
-          if curl -sf -o existing_latest.json "${domain}/${QINIU_DIR}/latest.json" \
+          if curl -sf -o existing_latest.json "https://${QINIU_DOMAIN}/${QINIU_DIR}/latest.json" \
              && jq empty existing_latest.json 2>/dev/null; then
             base="$(cat existing_latest.json)"
           else
@@ -418,7 +413,7 @@ jobs:
           echo "📄 latest.json:"
           cat latest.json
           qshell rput --overwrite "$QINIU_BUCKET" "${QINIU_DIR}/latest.json" "$(pwd)/latest.json"
-          echo "✅ https://${QINIU_DOMAIN}/${QINIU_DIR}/latest.json"
+          echo "✅ latest.json：https://${QINIU_DOMAIN}/${QINIU_DIR}/latest.json"
 
       # ======================================================================================
 
