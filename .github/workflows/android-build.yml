@@ -79,8 +79,11 @@ concurrency:
 
 env:
   SOURCE_DIR: source
-  # 源码仓库没有 .fvmrc 时的兜底版本；想锁版本就在源码仓库加 .fvmrc
-  FLUTTER_VERSION_FALLBACK: "stable"
+  # 源码仓库没有 .fvmrc 时的兜底 Flutter 版本；想锁版本就在源码仓库加 .fvmrc（优先于这里）
+  # 钉具体版本而不是 stable：stable 3.50.0 把 package:flutter/material.dart 标记为 deprecated，
+  # 会把 64 个文件报成 info，而 flutter analyze 默认 --fatal-infos=on，构建直接红。
+  # 升级这里的版本号前，先把源码迁到 package:material_ui/material_ui.dart。
+  FLUTTER_VERSION_FALLBACK: "3.47.9"
   JAVA_VERSION: "17"
   APP_NAME: AIP-Copilot
   # 七牛目录与产物名对齐 cowork-desk 的做法：aip-xxx-releases/ 平铺 + 版本号进文件名
