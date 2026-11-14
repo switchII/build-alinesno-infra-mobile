@@ -1,0 +1,435 @@
+name: Android Build & Publish
+
+# 运行位置
+#   本工作流属于「构建仓库」（GitHub 上的独立仓库，例如 build-alinesno-infra-mobile），
+#   被构建的源码在**另一个仓库**（云效 Codeup 的 alinesno-infra-mobile）。
+#   所以全程不使用 actions/checkout 拉当前仓库，而是按 tag clone 源码仓库再构建。
+#   本地这份文件是本仓库内的对照副本，真正执行的是构建仓库里的同一份。
+#
+# 流程
+#   1) 手动触发并填写 tag（留空取源码仓库最新 tag）→ 检出该 tag（克隆后校验 tag 是否存在）；
+#   2) 门禁：flutter analyze + flutter test（格式检查只提示，不阻塞）；
+#   3) 构建 APK（按 ABI 分包）/ AAB，版本号取自 tag（--build-name/--build-number）；
+#   4) 产物上传七牛（qshell，做法与 alinesno-infra-cowork-desk 的 build-windows-cli-sign.yml 一致），
+#      同时归档到 Actions Artifacts；
+#   5) 有 tag 时在构建仓库创建 draft Release。
+#
+# 需要配置的 Secrets
+#   MOBILE_GIT_REPOSITORY_URL       源码仓库地址（https://codeup.aliyun.com/.../alinesno-infra-mobile.git）
+#   MOBILE_GIT_REPOSITORY_USER      源码仓库账号（Codeup 用户名 / 访问令牌用户名）
+#   MOBILE_GIT_REPOSITORY_PASSWORD  源码仓库密码 / 访问令牌
+#   QINIU_ACCESS_KEY                七牛 AccessKey
+#   QINIU_SECRET_KEY                七牛 SecretKey
+#   QINIU_BUCKET                    七牛空间名
+#   QINIU_DOMAIN                    七牛下载域名（只填域名，不要带 https://）
+#   KEYSTORE_BASE64                 发布 keystore 的 base64 内容（可选）
+#   ANDROID_KEYSTORE_PASSWORD       密钥库密码（可选）
+#   ANDROID_KEY_ALIAS               密钥别名（可选）
+#   ANDROID_KEY_PASSWORD            密钥密码（可选，留空则与密钥库密码相同）
+#   Variables: API_BASE_URL         注入 --dart-define=API_BASE_URL（非密钥，放 Variables）
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建的 Git tag（留空取源码仓库最新 tag）"
+        required: false
+        default: ""
+        type: string
+      flavor:
+        description: "构建 flavor"
+        type: choice
+        default: test
+        options: [dev, test, prod]
+      build_target:
+        description: "产物类型"
+        type: choice
+        default: both
+        options: [apk, aab, both]
+  repository_dispatch:
+    types: [trigger-build-mobile]
+  workflow_call:
+    inputs:
+      tag:
+        description: "要构建的 Git tag"
+        required: false
+        default: ""
+        type: string
+      flavor:
+        description: "构建 flavor"
+        required: false
+        default: "test"
+        type: string
+      build_target:
+        description: "apk / aab / both"
+        required: false
+        default: "both"
+        type: string
+
+# Release 需要写权限；七牛凭据走 Secrets，不依赖仓库权限
+permissions:
+  contents: write
+  actions: read
+
+# 同一 tag 串行构建，避免并发覆盖七牛上的同名产物
+concurrency:
+  group: android-build-${{ inputs.tag || github.event.client_payload.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_DIR: source
+  # 源码仓库没有 .fvmrc 时的兜底版本；想锁版本就在源码仓库加 .fvmrc
+  FLUTTER_VERSION_FALLBACK: "stable"
+  JAVA_VERSION: "17"
+  APP_NAME: AIP-Copilot
+  # 七牛目录与产物名对齐 cowork-desk 的做法：aip-xxx-releases/ 平铺 + 版本号进文件名
+  QINIU_DIR: aip-mobile-releases
+  QINIU_BUCKET: ${{ secrets.QINIU_BUCKET }}
+  QINIU_DOMAIN: ${{ secrets.QINIU_DOMAIN }}
+  # 手动触发用 inputs.tag，repository_dispatch 用 client_payload.tag
+  TAG_INPUT: ${{ inputs.tag || github.event.client_payload.tag }}
+
+jobs:
+  android:
+    name: 拉取 tag → 构建 → 上传七牛
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # 仅在 Secrets 齐备时返回 true，供签名 / 上传步骤判断
+      KEYSTORE_READY: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' }}
+      QINIU_READY: ${{ secrets.QINIU_ACCESS_KEY != '' && secrets.QINIU_SECRET_KEY != '' && secrets.QINIU_BUCKET != '' }}
+      BUILD_NUMBER: ${{ github.run_number }}
+
+    steps:
+      - name: 克隆源码仓库并检出指定 tag
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="${{ secrets.MOBILE_GIT_REPOSITORY_URL }}"
+          if [ -z "$raw" ]; then
+            echo "::error::未配置 secrets.MOBILE_GIT_REPOSITORY_URL（源码仓库地址）"
+            exit 1
+          fi
+          repo="${raw#https://}"
+          repo="${repo#http://}"
+          repo_url="https://${{ secrets.MOBILE_GIT_REPOSITORY_USER }}:${{ secrets.MOBILE_GIT_REPOSITORY_PASSWORD }}@${repo}"
+
+          rm -rf "$SOURCE_DIR"
+          git clone "$repo_url" "$SOURCE_DIR"
+          cd "$SOURCE_DIR"
+
+          echo "===> 拉取 tags..."
+          git fetch --tags --force
+
+          if [ -n "${TAG_INPUT}" ]; then
+            selected="$TAG_INPUT"
+            echo "===> 使用输入的 tag：$selected"
+            if ! git rev-parse -q --verify "refs/tags/${selected}" >/dev/null; then
+              echo "::error::源码仓库中不存在 tag：${selected}"
+              echo "---- 最近 20 个 tag ----"
+              git tag --sort=-creatordate | head -20
+              exit 1
+            fi
+          else
+            echo "===> 未输入 tag，取源码仓库最新 tag..."
+            selected="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+            if [ -z "$selected" ]; then
+              echo "::error::源码仓库没有任何 tag，无法确定构建版本"
+              exit 1
+            fi
+            echo "===> 最新 tag：$selected"
+          fi
+
+          git checkout --detach "$selected"
+          version="${selected#v}"
+          # tag 里带 / 会污染产物名与七牛 key，统一换成 -
+          version="${version//\//-}"
+          commit="$(git rev-parse --short HEAD)"
+
+          {
+            echo "SELECTED_TAG=$selected"
+            echo "VERSION=$version"
+            echo "SOURCE_COMMIT=$commit"
+          } >> "$GITHUB_ENV"
+          {
+            echo "tag=$selected"
+            echo "version=$version"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "===> 构建来源：tag=$selected version=$version commit=$commit"
+          git log -1 --stat
+
+          pub_version="$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}' || true)"
+          echo "pubspec version=${pub_version:-unknown}（APK 实际版本以 tag 为准）"
+          echo "::notice::tag $selected → versionName=$version versionCode=$BUILD_NUMBER"
+
+      - name: 解析 Flutter 版本
+        id: flutter
+        shell: bash
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+          ver=""
+          if [ -f .fvmrc ]; then
+            ver=$(python3 -c "import json;print(json.load(open('.fvmrc')).get('flutter',''))" 2>/dev/null || true)
+          elif [ -f .fvm/fvm_config.json ]; then
+            ver=$(python3 -c "import json;print(json.load(open('.fvm/fvm_config.json')).get('flutterSdkVersion',''))" 2>/dev/null || true)
+          fi
+          ver="${ver%% *}"
+          if [ -z "$ver" ]; then ver="$FLUTTER_VERSION_FALLBACK"; fi
+          echo "FLUTTER_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "本次构建使用 Flutter：$ver"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('source/android/gradle/wrapper/gradle-wrapper.properties', 'source/android/**/*.gradle.kts', 'source/android/gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: flutter pub get
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: flutter pub get
+
+      - name: 代码生成（检测到 build_runner 时执行）
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+          if grep -q "build_runner" pubspec.yaml; then
+            dart run build_runner build --delete-conflicting-outputs
+          else
+            echo "未使用 build_runner，跳过"
+          fi
+
+      - name: 静态分析
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: flutter analyze
+
+      - name: 格式检查（仅提示，不阻塞构建）
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+          # 源码仓库当前尚未按 Dart 3.13 的格式化风格整理（一次 dart format . 会改上百个文件），
+          # 所以这里只报告不失败；整理完成后把这一步改成 --set-exit-if-changed 即可变成硬门禁。
+          report="$(dart format --output=none --show=changed . || true)"
+          echo "$report" | tail -20
+          changed=$(echo "$report" | grep -c '^Changed ' || true)
+          if [ "$changed" -gt 0 ]; then
+            echo "::warning::有 $changed 个文件不符合 dart format，建议在源码仓库执行 dart format ."
+          else
+            echo "格式检查通过"
+          fi
+
+      - name: 单元测试与 Widget 测试
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: flutter test --coverage
+
+      - name: 上传覆盖率
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-run-${{ github.run_number }}
+          path: ${{ env.SOURCE_DIR }}/coverage/lcov.info
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 解析构建参数
+        id: args
+        shell: bash
+        run: |
+          set -euo pipefail
+          flavor="${{ inputs.flavor }}"
+          if [ -z "$flavor" ]; then flavor="test"; fi
+          # 打 tag 的构建一律按发布环境处理
+          case "${SELECTED_TAG}" in
+            v*) flavor="prod" ;;
+          esac
+          # 源码尚未配置 productFlavors 时自动去掉 --flavor，避免构建失败
+          if grep -q "productFlavors" "$SOURCE_DIR/android/app/build.gradle" "$SOURCE_DIR/android/app/build.gradle.kts" 2>/dev/null; then
+            flavor_arg="--flavor $flavor"
+          else
+            flavor_arg=""
+            echo "::notice::未检测到 productFlavors 配置，本次构建不带 --flavor"
+          fi
+          echo "FLAVOR=$flavor" >> "$GITHUB_ENV"
+          echo "FLAVOR_ARG=$flavor_arg" >> "$GITHUB_ENV"
+          echo "flavor=$flavor" >> "$GITHUB_OUTPUT"
+
+      - name: 写入发布签名配置
+        if: env.KEYSTORE_READY == 'true'
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p android/keystores
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/keystores/release.jks
+          key_password="${{ secrets.ANDROID_KEY_PASSWORD }}"
+          if [ -z "$key_password" ]; then key_password="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"; fi
+          cat > android/key.properties <<EOF
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword=${key_password}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          storeFile=../keystores/release.jks
+          EOF
+          chmod 600 android/keystores/release.jks android/key.properties
+          echo "已写入 android/key.properties（文件与 *.jks 均被 .gitignore 忽略）"
+
+      - name: 签名检查
+        if: env.KEYSTORE_READY != 'true'
+        run: echo "::warning::未配置签名 Secrets，本次产物使用 debug 签名，不能作为对外发布包"
+
+      - name: 构建 APK（按 ABI 分包）
+        if: ${{ inputs.build_target != 'aab' }}
+        working-directory: ${{ env.SOURCE_DIR }}
+        env:
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          flutter build apk --release ${FLAVOR_ARG} --split-per-abi \
+            --build-name="${VERSION}" --build-number="${BUILD_NUMBER}" \
+            --dart-define=API_BASE_URL="${API_BASE_URL:-}"
+
+      - name: 构建 AAB
+        if: ${{ inputs.build_target != 'apk' }}
+        working-directory: ${{ env.SOURCE_DIR }}
+        env:
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          flutter build appbundle --release ${FLAVOR_ARG} \
+            --build-name="${VERSION}" --build-number="${BUILD_NUMBER}" \
+            --dart-define=API_BASE_URL="${API_BASE_URL:-}"
+
+      - name: 归集产物并统一命名
+        working-directory: ${{ env.SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+          dest="${{ github.workspace }}/dist/android/${FLAVOR}"
+          mkdir -p "$dest"
+          shopt -s nullglob
+          # APK：app-<abi>-release.apk → AIP-Copilot-<version>-<abi>.apk
+          for f in build/app/outputs/flutter-apk/*.apk; do
+            base="$(basename "$f")"
+            if [[ "$base" =~ ^app-(.+)-release\.apk$ ]]; then
+              abi="${BASH_REMATCH[1]}"
+            else
+              abi="universal"
+            fi
+            cp -f "$f" "$dest/${APP_NAME}-${VERSION}-${abi}.apk"
+          done
+          # AAB：app-release.aab / app-<flavor>-release.aab → AIP-Copilot-<version>.aab
+          for f in build/app/outputs/bundle/*/*.aab; do
+            cp -f "$f" "$dest/${APP_NAME}-${VERSION}.aab"
+            break
+          done
+          echo "---- 产物清单 ----"
+          ls -lh "$dest"
+
+      - name: 上传产物到 Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ env.VERSION }}-${{ env.FLAVOR }}-run-${{ github.run_number }}
+          path: dist/android/**
+          retention-days: 30
+          if-no-files-found: error
+
+      # ===================== 七牛云上传（对齐 cowork-desk 的 qshell 做法） =====================
+      - name: 安装 qshell
+        if: env.QINIU_READY == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/qshell"
+          curl -fsSL "https://github.com/qiniu/qshell/releases/download/v2.18.0/qshell-v2.18.0-linux-amd64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/qshell"
+          qshell_bin="$(find "$RUNNER_TEMP/qshell" -type f -name qshell | head -1)"
+          if [ -z "$qshell_bin" ]; then
+            echo "::error::qshell 解压后未找到可执行文件"
+            ls -R "$RUNNER_TEMP/qshell"
+            exit 1
+          fi
+          chmod +x "$qshell_bin"
+          echo "$(dirname "$qshell_bin")" >> "$GITHUB_PATH"
+          "$qshell_bin" version
+
+      - name: 未配置七牛 Secrets 的提示
+        if: env.QINIU_READY != 'true'
+        run: echo "::warning::未配置 QINIU_ACCESS_KEY / QINIU_SECRET_KEY / QINIU_BUCKET，跳过七牛上传，产物仅归档在 Actions Artifacts"
+
+      - name: 上传产物到七牛
+        if: env.QINIU_READY == 'true'
+        shell: bash
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          qshell account "$QINIU_ACCESS_KEY" "$QINIU_SECRET_KEY" "github-action"
+
+          shopt -s nullglob
+          files=("${{ github.workspace }}"/dist/android/"${FLAVOR}"/*)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::没有可上传的产物"
+            exit 1
+          fi
+
+          for f in "${files[@]}"; do
+            key="${QINIU_DIR}/$(basename "$f")"
+            qshell rput --overwrite "$QINIU_BUCKET" "$key" "$f"
+            echo "✅ 上传成功：https://${QINIU_DOMAIN}/${key}"
+          done
+      # ======================================================================================
+
+      - name: 构建结果摘要
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Android 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 源码 tag | \`${SELECTED_TAG:-未解析}\` |"
+            echo "| 版本 | \`${VERSION:-未知}\`（versionCode \`${BUILD_NUMBER}\`） |"
+            echo "| Flutter | \`${FLUTTER_VERSION:-未知}\` |"
+            echo "| Flavor | \`${FLAVOR:-test}\` |"
+            echo "| 发布签名 | $([ -f "${SOURCE_DIR}/android/keystores/release.jks" ] && echo '已注入' || echo '未配置，debug 签名') |"
+            echo "| 七牛上传 | $([ "${QINIU_READY:-false}" = "true" ] && echo "已开启（\`${QINIU_DIR}/\`）" || echo '未配置 Secrets，已跳过') |"
+            echo "| 触发 | \`${GITHUB_EVENT_NAME}\` / Run #${{ github.run_number }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -d "${{ github.workspace }}/dist" ]; then
+            {
+              echo ""
+              echo "### 产物"
+              find "${{ github.workspace }}/dist" -type f -exec ls -l {} \; | awk '{printf "- `%s`（%.1f MB）\n", $9, $5/1048576}'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 创建 Release（draft）
+        if: env.SELECTED_TAG != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.SELECTED_TAG }}
+          name: ${{ env.APP_NAME }} ${{ env.VERSION }} (Android)
+          draft: true
+          files: |
+            dist/android/${{ env.FLAVOR }}/*.apk
+            dist/android/${{ env.FLAVOR }}/*.aab
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
