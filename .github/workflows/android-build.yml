@@ -217,14 +217,20 @@ jobs:
         working-directory: ${{ env.SOURCE_DIR }}
         run: flutter pub get
 
-      - name: 代码生成（检测到 build_runner 时执行）
+      - name: 代码生成（仅在 build_runner 为真实依赖时执行）
         working-directory: ${{ env.SOURCE_DIR }}
         run: |
           set -euo pipefail
-          if grep -q "build_runner" pubspec.yaml; then
+          # 判据不能用 `grep build_runner pubspec.yaml`：pubspec 的注释里也写着
+          # "项目无 build_runner 基线"（sqflite 那段），注释命中后 dart 找不到包，
+          # 会以 "Could not find package `build_runner`" 退出 255 把构建打红。
+          # 改成同时看两处：pubspec 里以依赖键形式声明（行首空白后紧跟 build_runner:，
+          # 注释行以 # 开头不会命中），且 pub get 后确实解析进 package_config.json。
+          if grep -Eq '^[[:space:]]+build_runner:' pubspec.yaml \
+             && grep -q '"name": "build_runner"' .dart_tool/package_config.json; then
             dart run build_runner build --delete-conflicting-outputs
           else
-            echo "未使用 build_runner，跳过"
+            echo "未使用 build_runner（无声明或未解析），跳过代码生成"
           fi
 
       - name: 静态分析
